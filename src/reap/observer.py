@@ -20,6 +20,7 @@ from reap.metrics import (
     OnlineStatsTracker,
     get_distance_fn,
 )
+from reap.gpt_experts import compute_gptoss_activations, is_gptoss_module
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -352,9 +353,27 @@ class MoETransformerObserver(BaseTransformerObserver):
             flat_input = input.view(-1, hidden_dim)  # total_seq_len, hidden
             activations = torch.zeros((num_experts, *flat_input.shape), device=device)
 
-            if self.hook_config.fused_experts:
+            # Handle different MoE architectures
+            if is_gptoss_module(module):
+                # GptOss uses batched expert weights - delegate to specialized handler
+                activations, router_logits, selected_experts = compute_gptoss_activations(
+                    module=module,
+                    flat_input=flat_input,
+                    output=output,
+                    num_experts=num_experts,
+                    top_k=top_k,
+                    device=device,
+                )
+                # Convert dtype if needed
+                activations = activations.to(device)
+                
+            elif self.hook_config.fused_experts:
                 _, router_scores = output  # (num_experts, total_tokens)
-                router_logits = module.router(flat_input)  # (total_tokens, num_experts)
+                router_output = module.router(flat_input)  # might return tuple
+                if isinstance(router_output, tuple):
+                    router_logits, _ = router_output
+                else:
+                    router_logits = router_output
                 _, selected_experts = torch.topk(router_logits, top_k, dim=-1)
                 selected_experts = selected_experts.to(device)
                 router_indices = (
@@ -614,6 +633,14 @@ class Glm44MoEObserverHookConfig(MoETransformerObserverConfig):
     fused_experts: bool = False
 
 
+@dataclass
+class GptOssMoEObserverHookConfig(MoETransformerObserverConfig):
+    module_class_name_to_hook_regex: Optional[str] = "GptOssMLP"
+    num_experts_attr_name: str = "router.num_experts"
+    top_k_attr_name: str = "router.top_k"
+    fused_experts: bool = False  # GptOss has a different architecture
+
+
 OBSERVER_CONFIG_REGISTRY = {
     "Qwen3MoeForCausalLM": Qwen3MoEObserverHookConfig,
     "NonUniformQwen3MoeForCausalLM": Qwen3MoEObserverHookConfig,
@@ -623,4 +650,5 @@ OBSERVER_CONFIG_REGISTRY = {
     "Ernie4_5_MoEForCausalLM": Ernie4_5MoEObserverHookConfig,
     "Ernie4_5_MoeForCausalLM": Ernie4_5MoEObserverHookConfig,
     "Glm4MoeForCausalLM": Glm44MoEObserverHookConfig,
+    "GptOssForCausalLM": GptOssMoEObserverHookConfig,
 }

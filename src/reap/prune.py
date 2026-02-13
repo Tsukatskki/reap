@@ -10,10 +10,11 @@ import yaml
 
 import torch
 from tqdm import tqdm
-from transformers import AutoTokenizer, AutoModelForCausalLM, HfArgumentParser
+from transformers import AutoTokenizer, AutoModelForCausalLM, HfArgumentParser, DataCollatorForLanguageModeling
 
 from accelerate.utils import set_seed
 from accelerate.hooks import remove_hook_from_module
+from transformers import BitsAndBytesConfig
 
 
 from reap.main import record_activations, smoke_test, create_results_directory
@@ -26,7 +27,7 @@ from reap.args import (
     DatasetArgs,
     ClusterArgs,
 )
-from reap.data import DATASET_REGISTRY
+from reap.data import DATASET_REGISTRY, get_dataset
 from reap.cluster import (
     get_penalty_vector,
     hierarchical_clustering,
@@ -34,6 +35,8 @@ from reap.cluster import (
 )
 from reap.model_util import get_moe, assert_merge, MODEL_ATTRS, patched_model_map, get_super_expert_indices
 from reap.eval import run_evaluate
+from reap.gpt_experts import prune_gptoss_experts, compute_gptoss_activations
+from reap.finetune import finetune_router
 import shutil
 
 logger = logging.getLogger(__name__)
@@ -78,13 +81,13 @@ def dump_args_to_yaml(
         yaml.dump(serializable_args, f, default_flow_style=False)
     logger.info(f"All arguments saved to {output_path}")
 
-
 def prune(
     observer_data,
     model,
     tokenizer,
     reap_args,
     prune_args,
+    ds_args, 
     n_experts_to_prune,
     pruned_model_dir,
 ):
@@ -148,7 +151,11 @@ def prune(
         ]
         # prune experts
         moe = get_moe(model, layer)
-        if not model_attrs["fused"]:
+        
+        # Special handling for GptOss which uses batched expert weights
+        if model.__class__.__name__ == "GptOssForCausalLM":
+            prune_gptoss_experts(moe, model_attrs, retained_expert_indicies)
+        elif not model_attrs["fused"]:
             all_experts = getattr(moe, model_attrs["experts"])
             retained_experts = [all_experts[i] for i in retained_expert_indicies]
             retained_experts = torch.nn.ModuleList(retained_experts)
@@ -179,11 +186,30 @@ def prune(
                 retained_expert_indicies
             ]
             moe.experts.down_proj.data = moe.experts.down_proj[retained_expert_indicies]
+            
+            # prune fused expert biases
+            if hasattr(moe.experts, 'gate_up_proj_bias') and moe.experts.gate_up_proj_bias is not None:
+                moe.experts.gate_up_proj_bias.data = moe.experts.gate_up_proj_bias.data[retained_expert_indicies]
+            if hasattr(moe.experts, 'down_proj_bias') and moe.experts.down_proj_bias is not None:
+                moe.experts.down_proj_bias.data = moe.experts.down_proj_bias.data[retained_expert_indicies]
+            
             moe.num_experts = len(retained_expert_indicies)
             moe.router.weight.data = moe.router.weight.data[retained_expert_indicies]
             moe.router.out_features = len(retained_expert_indicies)
             if hasattr(moe.router, "num_experts"):  # transformers >= 4.54+
                 moe.router.num_experts = len(retained_expert_indicies)
+
+    # -------------------------------------------------------------------------
+    # OPTIONAL: Router Rehabilitation (Fine-tuning)
+    # -------------------------------------------------------------------------
+    # After physical pruning, the router's probability distribution may need adjustment.
+    # This can be done here or separately using finetune.py.
+    
+    if prune_args.finetune_router_after_prune:
+        logger.info("Fine-tuning router after pruning...")
+        finetune_router(model, tokenizer, ds_args, steps=prune_args.router_finetune_steps)
+    else:
+        logger.info("Skipping router fine-tuning. You can run finetune.py separately if needed.")
 
     # patch config and dump
     logger.info("Saving pruned model...")
@@ -198,6 +224,11 @@ def prune(
 
     pruned_model_dir.mkdir(parents=True, exist_ok=True)
     start = time.time()
+    # Ensure contiguous tensors before saving to avoid safetensors errors with sliced tensors
+    for name, param in model.named_parameters():
+        if not param.is_contiguous():
+            param.data = param.data.contiguous()
+            
     model.save_pretrained(pruned_model_dir)
     end = time.time()
     logger.info(
@@ -226,6 +257,7 @@ def get_pruned_model_dir(
     pruned_model_name += f"-{compression_ratio_str}"
     pruned_model_dir = results_dir / "pruned_models" / pruned_model_name
     logger.info(f"Using seed {seed}, pruned model dir: {pruned_model_dir}")
+    logger.info(f"PRUNED_MODEL_DIR_PATH: {pruned_model_dir}")
     return pruned_model_dir
 
 
@@ -253,12 +285,17 @@ def main():
     model_name = patched_model_map(model_args.model_name)
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
     # load model
+    bnb_config = BitsAndBytesConfig(
+        load_in_8bit=True,
+        llm_int8_threshold=6.0,
+        llm_int8_has_fp16_weight=False,
+    )
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
         device_map="auto",
         torch_dtype="auto",
         trust_remote_code=True,
-        local_files_only=True,
+        local_files_only=True
     )
     # record activations or load previously recorded activations
     logger.info(
@@ -318,6 +355,7 @@ def main():
             tokenizer,
             reap_args,
             prune_args,
+            ds_args,  # Pass ds_args here for fine-tuning
             n_experts_to_prune,
             pruned_model_dir,
         )

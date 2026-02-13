@@ -1,13 +1,14 @@
 #!/bin/bash
 
-export CUDA_VISIBLE_DEVICES=${1}
-FIRST_DEVICE=$(echo "$1" | cut -d',' -f1)
+export CUDA_VISIBLE_DEVICES=${1:-"2,3"}
+FIRST_DEVICE=$(echo "$CUDA_VISIBLE_DEVICES" | cut -d',' -f1)
 port=$((8000 + FIRST_DEVICE))
-model_name=${2:-"Qwen/Qwen3-30B-A3B"}
+model_name=${2:-"unsloth/gpt-oss-20b-BF16"}
 pruning_method=${3:-"reap"}
 seed=${4:-42}
-compression_ratio=${5:-0.25}
-dataset_name=${6:-"theblackcat102/evol-codealpaca-v1"}
+compression_ratio=${5:-0.5}
+dataset_name=${6:-"m-a-p/CodeFeedback-Filtered-Instruction"}
+
 # qa
 run_lm_eval=${7:-true}
 # coding
@@ -19,7 +20,11 @@ run_math=${10:-false}
 run_wildbench=${11:-false}
 singleton_super_experts=${12:-"false"}
 singleton_outlier_experts=${13:-"false"}
-num_samples=1024
+
+# datasets
+num_samples=${14:-1024}
+split_by_category=${15:-"false"}
+select_only_categories=${16:-"python"}
 output_file_name="observations_${num_samples}_cosine-seed_${seed}.pt"
 
 
@@ -31,6 +36,14 @@ echo "Evaluations: lm_eval: $run_lm_eval, evalplus: $run_evalplus, livecodebench
 echo "Using seed: $seed"
 
 echo "Running with model: $model_name, dataset: $dataset_name, compression ratio: $compression_ratio, pruning method: $pruning_method"
+
+# Activate virtual environment if it exists
+if [ -f ".venv/bin/activate" ]; then
+    source .venv/bin/activate
+fi
+
+echo "Step 1: Pruning the model from huggingface repository..."
+# split-by-category is needed when using dataset: "m-a-p/CodeFeedback-Filtered-Instruction"
 python src/reap/prune.py \
     --model-name $model_name \
     --dataset-name $dataset_name \
@@ -46,33 +59,22 @@ python src/reap/prune.py \
     --singleton_super_experts ${singleton_super_experts} \
     --singleton_outlier_experts ${singleton_outlier_experts} \
     --samples_per_category ${num_samples} \
-    --record_pruning_metrics_only true
+    --split-by-category ${split_by_category} \
+    --record_pruning_metrics_only false \
+    --finetune_router_after_prune false 2>&1 | tee pruning_output.log
+# --select-only-categories ${select_only_categories} 
 
-short_model_name=$(echo $model_name | cut -d'/' -f2)
-short_dataset_name=$(echo $dataset_name | cut -d'/' -f2)
+# Extract the actual pruned model directory from prune.py output
+# This ensures path consistency between Python and Shell
+echo "Extracting pruned model directory path..."
+pruned_model_dir=$(grep "PRUNED_MODEL_DIR_PATH:" pruning_output.log | tail -1 | awk '{print $2}')
 
-pruned_model_dir_name="${pruning_method}"
-if [[ "${singleton_super_experts}" == "true" ]]; then
-    pruned_model_dir_name="${pruned_model_dir_name}-perserve_super"
-elif [[ "${singleton_outlier_experts}" == "true" ]]; then
-    pruned_model_dir_name="${pruned_model_dir_name}-perserve_outlier"
+if [ -z "$pruned_model_dir" ]; then
+    echo "Error: Could not extract pruned model directory path from prune.py output"
+    exit 1
 fi
-pruned_model_dir_name="${pruned_model_dir_name}-seed_${seed}-${compression_ratio}"
 
-model_dir="artifacts/${short_model_name}/${short_dataset_name}/pruned_models/${pruned_model_dir_name}"
+echo "✅ Pruning completed successfully!"
+echo "Pruned model saved to: ${pruned_model_dir}"
+echo "OUTPUT_PATH:${pruned_model_dir}"
 
-echo "evaluating model: ${model_dir}"
-bash experiments/eval.sh \
-    $model_dir \
-    $seed\
-    $port \
-    $server_log_file_name \
-    ${run_lm_eval} \
-    ${run_evalplus} \
-    ${run_livecodebench} \
-    ${run_math} \
-    ${run_wildbench}
-echo "Finished evaluating model: ${pruned_model}"
-
-# echo "Removing safetensor files from ${model_dir}"
-# rm ${model_dir}/*.safetensors

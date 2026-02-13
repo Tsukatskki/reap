@@ -93,16 +93,16 @@ MODEL_ATTRS = {
         "num_experts": "moe_num_experts",
         "num_experts_per_tok": "moe_k",
     },
-    "gpt-oss-20b": {
-        "moe_block": "mlp",
-        "gate_proj": "gate_proj",
-        "up_proj": "up_proj",
-        "down_proj": "down_proj",
-        "experts": "experts",
-        "fused": False,
-        "router": "gate",
-        "num_experts": "num_experts",
-        "num_experts_per_tok": "num_experts_per_tok",
+    "GptOssForCausalLM": {
+    "moe_block": "mlp",           
+    "experts": "experts",         
+    "router": "router",         
+    "gate_proj": "gate_up_proj", 
+    "up_proj": "gate_up_proj",   
+    "down_proj": "down_proj",
+    "num_experts": "num_local_experts",
+    "num_experts_per_tok": "top_k", # Verify attribute name; could be top_k or num_experts_per_tok
+    "is_batched": True,         
     },
     "Glm4MoeForCausalLM": {
         "moe_block": "mlp",

@@ -139,6 +139,7 @@ def record_activations(
         max_input_len=obs_args.model_max_length,
         split=ds_args.split,
         split_by_category=obs_args.split_by_category,
+        select_only_categories=obs_args.select_only_categories,
         return_vllm_tokens_prompt=obs_args.return_vllm_tokens_prompt,
         truncate=obs_args.truncate,
     )

@@ -71,6 +71,22 @@ class ModelArgs:
 
 
 @dataclass
+class FineTuneArgs:
+    router_finetune_steps: int = field(
+        default=1000,
+        metadata={
+            "help": "Number of training steps for router fine-tuning."
+        },
+    )
+    gradient_accumulation_steps: int = field(
+        default=4,
+        metadata={
+            "help": "Number of gradient accumulation steps to reduce memory usage."
+        },
+    )
+
+
+@dataclass
 class DatasetArgs:
     dataset_name: str = field(
         default="theblackcat102/evol-codealpaca-v1",
@@ -525,6 +541,20 @@ class PruneArgs:
             "help": (
                 "Whether to perserve outlier experts when pruning, includes all layers"
             )
+        }
+    )
+    finetune_router_after_prune: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Whether to fine-tune router after pruning. If False, you can run finetune.py separately."
+            )
+        }
+    )
+    router_finetune_steps: int = field(
+        default=200,
+        metadata={
+            "help": "Number of steps for router fine-tuning after pruning."
         }
     )
 

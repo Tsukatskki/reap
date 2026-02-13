@@ -276,7 +276,8 @@ class ChatDatasetProcessor(BaseDatasetProcessor):
         return self.tokenizer(
             chat_sample,
             truncation=self.truncate,
-            max_length=self.tokenizer.model_max_length if self.truncate else None,
+            # max_length=self.tokenizer.model_max_length if self.truncate else None,
+            max_length=self.max_input_len if self.truncate else None,
             return_tensors="pt",
         )["input_ids"]
 
@@ -303,7 +304,8 @@ class LMDatasetProcessor(BaseDatasetProcessor):
         return self.tokenizer(
             sample[self.text_field],
             truncation=self.truncate,
-            max_length=self.tokenizer.model_max_length if self.truncate else None,
+            # max_length=self.tokenizer.model_max_length if self.truncate else None,
+            max_length=self.max_input_len if self.truncate else None,
             return_tensors="pt",
         )["input_ids"]
 
@@ -321,11 +323,15 @@ class LMDatasetProcessor(BaseDatasetProcessor):
 
 class CodeFeedbackChatDataset(ChatDatasetProcessor):
     category_field: str = "lang"
-    messages_field: str = "text_fieldmessages"
 
     @staticmethod
     def _map_fn(sample: dict[str, any]) -> dict[str, any]:
-        return sample
+        return {
+            "messages": [
+                {"role": "user", "content": sample["query"]},
+                {"role": "assistant", "content": sample["answer"]},
+            ],
+        }
 
 
 class TuluSFTMixtureChatDataset(ChatDatasetProcessor):
@@ -433,3 +439,99 @@ DATASET_REGISTRY: dict[str, BaseDatasetProcessor] = {
     "euclaise/WritingPrompts_curated": WritingPromptsChatDataset,
     "allenai/tulu-3-sft-personas-math": PersonasMathChatDataset,
 }
+
+# --- Helper Functions (Add this to the end of the file) -----------------------
+
+def get_dataset(
+    dataset_name: str,
+    tokenizer: AutoTokenizer,
+    split: str = "train",
+    num_samples: int | None = None,
+    seq_length: int = 2048,
+) -> Dataset:
+    """
+    Helper function to load and process a dataset for router fine-tuning.
+    It loads the raw dataset, applies the correct formatting (via Processor),
+    and tokenizes it.
+    """
+    from datasets import load_dataset
+    import torch
+
+    if num_samples is not None and num_samples <= 0:
+        logger.warning(f"num_samples received {num_samples}, forcing to 100.")
+        num_samples = 100
+
+    if dataset_name not in DATASET_REGISTRY:
+        # If no dataset processor is found, try generic C4LMDataset or error
+        logger.warning(f"Dataset {dataset_name} not found in registry. Trying generic load.")
+        # You can error out here or fall back to default handling
+        if "c4" in dataset_name:
+             processor_cls = C4LMDataset
+        else:
+             raise ValueError(f"Dataset {dataset_name} is not registered in DATASET_REGISTRY.")
+    else:
+        processor_cls = DATASET_REGISTRY[dataset_name]
+
+    # 1. Load Raw Dataset
+    try:
+        # Some datasets may not have a 'train' split; try default
+        raw_dataset = load_dataset(dataset_name, split=split, trust_remote_code=True)
+    except Exception as e:
+        logger.warning(f"Failed to load {split} split for {dataset_name}: {e}. Trying 'train'.")
+        raw_dataset = load_dataset(dataset_name, split="train", trust_remote_code=True)
+
+
+    if len(raw_dataset) == 0:
+        raise ValueError(f"Dataset {dataset_name} is empty!")
+
+    if num_samples is not None:
+        safe_num_samples = min(int(num_samples), len(raw_dataset))
+        if safe_num_samples > 0:
+            raw_dataset = raw_dataset.shuffle(seed=42).select(range(safe_num_samples))
+        else:
+             # If the calculation is 0, use full dataset or error
+             logger.warning("num_samples calculation resulted in 0, using full dataset.")
+
+    # 3. Initialize Processor
+    # Instantiate to use its _map_fn and _encode_sample methods
+    processor = processor_cls(
+        dataset=raw_dataset,
+        tokenizer=tokenizer,
+        max_input_len=seq_length,
+        truncate=True,
+        split=split
+    )
+
+    # 4. Apply Mapping and Tokenization
+    # Define a function compatible with HuggingFace map
+    def process_and_tokenize(sample):
+        # A. Format data (e.g., convert 'instruction' to 'messages')
+        mapped_sample = processor._map_fn(sample)
+        
+        # B. Tokenize (use processor logic, handle chat template, etc.)
+        # _encode_sample returns a [1, seq_len] tensor
+
+        # import pdb; pdb.set_trace()
+
+        try:
+            encoded_tensor = processor._encode_sample(mapped_sample)
+            input_ids = encoded_tensor[0].tolist() # Convert back to list for HF Dataset
+        except Exception:
+            # Fallback: tokenization failed (e.g., empty text)
+            return {"input_ids": []}
+
+        # DataCollatorForLanguageModeling only needs input_ids (auto-generates labels)
+        return {"input_ids": input_ids}
+
+    # Run map
+    tokenized_dataset = raw_dataset.map(
+        process_and_tokenize,
+        remove_columns=raw_dataset.column_names, # Remove raw text columns, keep only input_ids
+        desc="Processing dataset for router tuning"
+    )
+
+    # Filter out empty samples
+    tokenized_dataset = tokenized_dataset.filter(lambda x: len(x["input_ids"]) > 0)
+
+    logger.info(f"Loaded and processed {len(tokenized_dataset)} samples from {dataset_name}")
+    return tokenized_dataset
