@@ -1,6 +1,6 @@
 #!/bin/bash
 
-pruned_model_dir=${1:-"/home/yshdouble/Documents/reap/artifacts/gpt-oss-20b-BF16/CodeFeedback-Filtered-Instruction/pruned_models/reap-seed_42-0.50"}
+pruned_model_dir=${1}
 export CUDA_VISIBLE_DEVICES=${2:-"0,1,2,3"}
 dataset_name=${3:-"m-a-p/CodeFeedback-Filtered-Instruction"}
 router_finetune_steps=${4:-1000}
